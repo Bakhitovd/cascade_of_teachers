@@ -88,6 +88,18 @@ def parse_args() -> argparse.Namespace:
         default="cuda:0",
         help="Torch device for models, e.g. cuda:0 or cpu.",
     )
+    parser.add_argument(
+        "--max-samples",
+        type=int,
+        default=0,
+        help="Limit number of samples per shard for dev/debug (0 = no limit).",
+    )
+    parser.add_argument(
+        "--debug-manifest",
+        type=str,
+        default=None,
+        help="Optional path to a small CSV manifest for dev/debug; overrides config.manifests[lang].",
+    )
     return parser.parse_args()
 
 
@@ -212,102 +224,230 @@ class WhisperASR:
 
 
 class M2MTranslator:
+    """
+    M2M100-based MT wrapper.
+
+    Implements RU<->EN translation via facebook/m2m100_1.2B.
+    """
+
     def __init__(self, device: str):
         self.device = torch.device(device)
-        # TODO: uncomment & adjust once transformers installed
-        #
-        # from transformers import M2M100ForConditionalGeneration, M2M100Tokenizer
-        # self.tokenizer = M2M100Tokenizer.from_pretrained("facebook/m2m100_1.2B")
-        # self.model = M2M100ForConditionalGeneration.from_pretrained(
-        #     "facebook/m2m100_1.2B"
-        # ).to(self.device)
-        # self.model.eval()  
 
+        from transformers import M2M100ForConditionalGeneration, M2M100Tokenizer
+
+        model_name = "facebook/m2m100_1.2B"
+        logging.info(f"[M2MTranslator] Loading {model_name} on {self.device}")
+
+        self.tokenizer = M2M100Tokenizer.from_pretrained(model_name)
+        self.model = M2M100ForConditionalGeneration.from_pretrained(model_name).to(
+            self.device
+        )
+        self.model.eval()
+
+        # Map simple ISO codes to M2M codes (these happen to be the same for en/ru).
+        self.lang_map = {
+            "ru": "ru",
+            "en": "en",
+        }
+
+    @torch.inference_mode()
     def translate(self, text: str, src_lang: str, tgt_lang: str) -> str:
         """
         :param text: input text in src_lang
         :param src_lang: 'ru' or 'en'
         :param tgt_lang: 'en' or 'ru'
         """
-        # TODO: implement actual M2M translation.
-        # Example:
-        #
-        # self.tokenizer.src_lang = src_lang
-        # encoded = self.tokenizer(text, return_tensors="pt").to(self.device)
-        # generated = self.model.generate(
-        #     **encoded,
-        #     forced_bos_token_id=self.tokenizer.get_lang_id(tgt_lang),
-        # )
-        # out = self.tokenizer.batch_decode(generated, skip_special_tokens=True)[0].strip()
-        # return out
-        raise NotImplementedError("M2MTranslator.translate not implemented")
+        if not text or not text.strip():
+            return ""
+
+        if src_lang not in self.lang_map or tgt_lang not in self.lang_map:
+            raise ValueError(f"Unsupported language pair: {src_lang}->{tgt_lang}")
+
+        src = self.lang_map[src_lang]
+        tgt = self.lang_map[tgt_lang]
+
+        # Set source language for tokenizer
+        self.tokenizer.src_lang = src
+
+        encoded = self.tokenizer(
+            text,
+            return_tensors="pt",
+            padding=True,
+        ).to(self.device)
+
+        generated = self.model.generate(
+            **encoded,
+            forced_bos_token_id=self.tokenizer.get_lang_id(tgt),
+            # You can tune decoding if needed:
+            # max_new_tokens=128,
+            # num_beams=4,
+        )
+
+        out = self.tokenizer.batch_decode(
+            generated,
+            skip_special_tokens=True,
+        )[0].strip()
+
+        return out
 
 
 class ECAPASpeakerEncoder:
+    """
+    ECAPA-TDNN speaker encoder using SpeechBrain.
+
+    Produces a single embedding vector for a given utterance.
+    """
+
     def __init__(self, device: str):
         self.device = torch.device(device)
-        # TODO: uncomment once speechbrain installed
-        #
-        # from speechbrain.pretrained import SpeakerRecognition
-        # self.rec = SpeakerRecognition.from_hparams(
-        #     source="speechbrain/spkrec-ecapa-voxceleb",
-        #     savedir="pretrained_models/spkrec-ecapa-voxceleb",
-        # )
-        # self.rec.to(self.device)
+        from speechbrain.inference import SpeakerRecognition
 
+        logging.info(f"[speaker] Loading ECAPA-TDNN on {self.device}")
+        # Let SpeechBrain use the HuggingFace cache directly; do not force a savedir,
+        # to avoid symlink operations into the project tree on Windows.
+        self.rec = SpeakerRecognition.from_hparams(
+            source="speechbrain/spkrec-ecapa-voxceleb",
+            run_opts={"device": str(self.device)},
+        )
+
+    @torch.inference_mode()
     def embed(self, waveform: np.ndarray, sr: int) -> np.ndarray:
         """
         :param waveform: float32 numpy array [T]
         :param sr: sampling rate (expected 16k)
         :return: speaker embedding np.ndarray [D]
         """
-        # TODO: implement ECAPA embedding.
-        # Example:
-        #
-        # import torch
-        # wav_tensor = torch.from_numpy(waveform).float().unsqueeze(0).to(self.device)
-        # with torch.no_grad():
-        #     emb = self.rec.encode_batch(wav_tensor).squeeze(0).squeeze(0)
-        # return emb.cpu().numpy()
-        raise NotImplementedError("ECAPASpeakerEncoder.embed not implemented")
+        if sr != 16000:
+            logging.error(f"[speaker] Expected sr=16000, got {sr}")
+            raise ValueError(f"ECAPA expects sr=16000, got {sr}")
+
+        if waveform.ndim != 1:
+            raise ValueError(f"ECAPA expects 1D mono waveform, got shape {waveform.shape}")
+
+        # [T] -> [1, T] on the target device
+        wav_tensor = torch.from_numpy(waveform).float().unsqueeze(0).to(self.device)
+
+        # Encode to get embedding; SpeechBrain returns [batch, emb_dim] or [batch, 1, emb_dim]
+        emb = self.rec.encode_batch(wav_tensor)
+        emb = emb.squeeze(0).squeeze(0)  # [D]
+
+        emb_np = emb.cpu().numpy().astype(np.float32)
+        logging.info(f"[speaker] Computed ECAPA embedding with shape {emb_np.shape}")
+        return emb_np
 
 
 class OpenVoiceSynth:
+    """
+    MeloTTS-based TTS (no voice cloning yet).
+
+    This wrapper uses MeloTTS models from the OpenVoice ecosystem to synthesize
+    target-language speech. It does NOT yet perform tone-color conversion or
+    use the ECAPA embedding; those can be added later once the basic TTS path
+    is stable in this environment.
+    """
+
     def __init__(self, device: str):
         self.device = torch.device(device)
-        # TODO: initialize OpenVoice model according to its repo instructions.
-        # This will be project-specific.
+        logging.info(f"[openvoice] Initializing MeloTTS-based TTS on {self.device}")
+
+        # Local import so the rest of the script can still run if MeloTTS is missing.
+        try:
+            from melo.api import TTS  # type: ignore[import]
+        except Exception as e:
+            logging.error(
+                f"[openvoice] Failed to import MeloTTS (melo.api.TTS). "
+                f"OpenVoiceSynth will fall back to silence. Error: {e}"
+            )
+            self.TTS = None
+        else:
+            self.TTS = TTS
+
+        # Directory for temporary wavs
+        self.tmp_dir = Path("openvoice_tmp")
+        ensure_dir(self.tmp_dir)
+
+        # Map our simple language codes to MeloTTS language codes.
+        # For ru→en, we only need English for now.
+        self.lang_map = {
+            "en": "EN_NEWEST",  # newest English base speaker model in MeloTTS
+        }
 
     def synthesize(
         self,
         text: str,
         speaker_embedding: np.ndarray,
         tgt_lang: str,
+        src_audio_path: Path,
         sample_rate: int = 24000,
     ) -> np.ndarray:
         """
         :param text: target language text
-        :param speaker_embedding: np.ndarray [D]
-        :param tgt_lang: 'en' or 'ru'
+        :param speaker_embedding: np.ndarray [D] (currently unused)
+        :param tgt_lang: 'en' or 'ru' (currently only 'en' is supported in this wrapper)
+        :param src_audio_path: Path to source/reference waveform (unused for now)
         :param sample_rate: desired output sample rate
         :return: waveform float32 [T] at sample_rate
         """
-        # TODO: implement OpenVoice synthesis (TTS/VC).
-        raise NotImplementedError("OpenVoiceSynth.synthesize not implemented")
+        if not text or not text.strip():
+            # Very short silence for empty text
+            return np.zeros(int(sample_rate * 0.5), dtype=np.float32)
+
+        if self.TTS is None:
+            logging.warning(
+                "[openvoice] MeloTTS (melo.api.TTS) is not available; "
+                "falling back to silence."
+            )
+            return np.zeros(int(sample_rate * 1.0), dtype=np.float32)
+
+        if tgt_lang not in self.lang_map:
+            raise NotImplementedError(
+                f"OpenVoice/MeloTTS wrapper currently only supports tgt_lang in "
+                f"{list(self.lang_map.keys())}, got {tgt_lang}"
+            )
+
+        language_code = self.lang_map[tgt_lang]
+
+        # 1) Use MeloTTS to synthesize base speech for the given text
+        model = self.TTS(language=language_code, device=str(self.device))
+        speaker_ids = model.hps.data.spk2id
+        if not speaker_ids:
+            raise RuntimeError("[openvoice] No speakers found in MeloTTS model")
+
+        # Pick the first available speaker as base speaker
+        base_speaker_key = next(iter(speaker_ids.keys()))
+        base_speaker_id = speaker_ids[base_speaker_key]
+
+        tgt_path = self.tmp_dir / "tmp_tgt.wav"
+        # Speed is adjustable; keep default 1.0 for now
+        model.tts_to_file(text, base_speaker_id, str(tgt_path), speed=1.0)
+
+        # 2) Load resulting audio and return as np.ndarray
+        wav, sr = sf.read(str(tgt_path), always_2d=False)
+        if wav.ndim == 2:
+            wav = wav.mean(axis=1)
+        wav = wav.astype(np.float32)
+
+        if sr != sample_rate:
+            logging.warning(
+                f"[openvoice] MeloTTS output has sr={sr}, expected {sample_rate}; "
+                "returning audio without resampling."
+            )
+            return wav
+
+        return wav
 
 
 class EncodecWrapper:
+    """
+    EnCodec stub.
+
+    For Option C we do not depend on the real EncodecModel; instead
+    we return a small fixed-size zero code tensor.
+    """
+
     def __init__(self, device: str):
         self.device = torch.device(device)
-        # TODO: uncomment once encodec installed
-        #
-        # from encodec import EncodecModel
-        # from encodec.utils import convert_audio
-        # self.model = EncodecModel.encodec_model_24khz()
-        # self.model.set_target_bandwidth(6.0)  # kbps
-        # self.model.to(self.device)
-        # self.model.eval()
-        # self.convert_audio = convert_audio
+        # Real Encodec initialization intentionally omitted.
 
     def encode(self, waveform: np.ndarray, sr: int) -> np.ndarray:
         """
@@ -315,16 +455,8 @@ class EncodecWrapper:
         :param sr: sample rate of waveform (e.g. 24000)
         :return: codes np.ndarray [num_codebooks, num_frames]
         """
-        # TODO: implement EnCodec encoding.
-        # Example:
-        #
-        # wav_tensor = torch.from_numpy(waveform).float().unsqueeze(0).to(self.device)
-        # wav_24k = self.convert_audio(wav_tensor, sr, 24000, 1)
-        # with torch.no_grad():
-        #     encoded_frames = self.model.encode(wav_24k)
-        # codes = torch.cat([f.codes for f in encoded_frames], dim=-1)  # [B, Q, T]
-        # return codes.squeeze(0).cpu().numpy()
-        raise NotImplementedError("EncodecWrapper.encode not implemented")
+        # Stub: 4 codebooks, 10 frames of zeros.
+        return np.zeros((4, 10), dtype=np.int64)
 
 
 # =========================
@@ -333,16 +465,19 @@ class EncodecWrapper:
 
 def load_audio(path: Path, target_sr: int = 16000) -> (np.ndarray, int):
     """Load mono audio as float32 numpy array [T]."""
+    logging.info(f"[audio] Loading {path} (target_sr={target_sr})")
     wav, sr = sf.read(str(path), always_2d=False)
     if wav.ndim == 2:
         wav = wav.mean(axis=1)
     wav = wav.astype(np.float32)
 
     if sr != target_sr:
+        logging.error(f"[audio] Expected sr={target_sr}, got {sr} at {path}")
         # TODO: use librosa or torchaudio resample
         # e.g. librosa.resample(wav, orig_sr=sr, target_sr=target_sr)
         raise NotImplementedError("Resampling not implemented yet")
 
+    logging.info(f"[audio] Loaded {len(wav) / sr:.2f}s of audio from {path}")
     return wav, target_sr
 
 
@@ -409,7 +544,7 @@ def process_sample(
     direction: str,
     data_root: Path,
     output_root: Path,
-) -> None:
+) -> Dict[str, Any]:
     """
     Process one row from manifest into a parallel/<direction>/<id>/ directory.
     """
@@ -420,7 +555,10 @@ def process_sample(
     sample_id = sample_id.replace("/", "_").replace("\\", "_").replace(":", "_")
 
     out_dir = output_root / "data" / "parallel" / direction / sample_id
+    logging.info(f"[sample] Starting id={sample_id} direction={direction} src_lang={src_lang} tgt_lang={tgt_lang}")
+    logging.info(f"[sample] Output dir: {out_dir}")
     if is_done_dir(out_dir):
+        logging.info(f"[sample] Skipping id={sample_id} because DONE marker exists")
         return
 
     ensure_dir(out_dir)
@@ -428,6 +566,7 @@ def process_sample(
     audio_rel = row["audio_path"]
     audio_path = data_root / Path(audio_rel)
     audio_path = audio_path.resolve()
+    logging.info(f"[sample] id={sample_id} audio_rel={audio_rel} resolved_path={audio_path}")
 
     if not audio_path.exists():
         raise FileNotFoundError(f"Audio file not found: {audio_path}")
@@ -435,18 +574,22 @@ def process_sample(
     # 0) Load audio
     target_sr = 16000
     wav_src, sr_src = load_audio(audio_path, target_sr=target_sr)
+    logging.info(f"[sample] id={sample_id} loaded src audio: {len(wav_src) / sr_src:.2f}s at {sr_src} Hz")
 
     # 1) Whisper ASR
     whisper: WhisperASR = models["whisper"]
     src_text = whisper.transcribe(wav_src, sr_src, language=src_lang)
+    logging.info(f"[whisper] id={sample_id} src_len={len(src_text)} text_preview={src_text[:80]!r}")
 
     # 2) Translation
     translator: M2MTranslator = models["translator"]
     tgt_text = translator.translate(src_text, src_lang=src_lang, tgt_lang=tgt_lang)
+    logging.info(f"[m2m] id={sample_id} tgt_len={len(tgt_text)} text_preview={tgt_text[:80]!r}")
 
     # 3) Speaker embedding from src.wav
     spk_encoder: ECAPASpeakerEncoder = models["speaker"]
     spk_emb = spk_encoder.embed(wav_src, sr_src)
+    logging.info(f"[speaker] id={sample_id} emb_shape={spk_emb.shape}")
 
     # 4) OpenVoice synthesis in target language
     openvoice: OpenVoiceSynth = models["openvoice"]
@@ -454,13 +597,16 @@ def process_sample(
         text=tgt_text,
         speaker_embedding=spk_emb,
         tgt_lang=tgt_lang,
-        sample_rate=24000,  # or whatever OpenVoice expects
+        src_audio_path=audio_path,
+        sample_rate=24000,  # OpenVoice V2 expects 24 kHz
     )
     sr_tgt = 24000
+    logging.info(f"[openvoice] id={sample_id} tgt_audio_len={len(wav_tgt) / sr_tgt:.2f}s at {sr_tgt} Hz")
 
     # 5) EnCodec tokens from tgt.wav
     encodec: EncodecWrapper = models["encodec"]
     tokens = encodec.encode(wav_tgt, sr_tgt)
+    logging.info(f"[encodec] id={sample_id} tokens_shape={tokens.shape}")
 
     # ---- Save outputs ----
     # src.wav (you can either copy original or re-save normalized)
@@ -503,6 +649,21 @@ def process_sample(
 
     # DONE marker
     mark_done(out_dir)
+    logging.info(f"[sample] Finished id={sample_id} status=ok")
+
+    # Return summary info for optional debug logging.
+    return {
+        "id": sample_id,
+        "audio_path": str(audio_path),
+        "src_lang": src_lang,
+        "tgt_lang": tgt_lang,
+        "src_text": src_text,
+        "tgt_text": tgt_text,
+        "src_duration_s": float(row.get("duration_s", len(wav_src) / sr_src)),
+        "tgt_duration_s": float(len(wav_tgt) / sr_tgt),
+        "status": "ok",
+        "out_dir": str(out_dir),
+    }
 
 
 # =========================
@@ -539,10 +700,20 @@ def main():
     output_root = Path(cfg["output_root"]).expanduser().resolve()
     ensure_dir(output_root)
 
-    # Select manifest based on lang
-    manifest_path = cfg["manifests"][args.lang]
+    # Select manifest based on lang or optional debug override
+    if args.debug_manifest:
+        manifest_path = args.debug_manifest
+        logging.info(f"Using DEBUG manifest from CLI: {manifest_path}")
+    else:
+        manifest_path = cfg["manifests"][args.lang]
+
     df = load_manifest(manifest_path, lang=args.lang, cfg=cfg)
     df_shard = shard_dataframe(df, shard_idx=args.shard_idx, num_shards=args.num_shards)
+
+    # Optional dev/debug limit on number of samples per shard
+    if args.max_samples > 0:
+        df_shard = df_shard.iloc[: args.max_samples].reset_index(drop=True)
+        logging.info(f"Dev mode: limiting to first {len(df_shard)} samples (max-samples={args.max_samples})")
 
     models = init_models(torch_device)
 
@@ -550,11 +721,15 @@ def main():
     num_processed = 0
     num_failed = 0
 
+    # For dev/debug runs we optionally collect a compact summary table.
+    collect_debug = args.debug_manifest is not None or args.max_samples > 0
+    debug_rows: List[Dict[str, Any]] = []
+
     with open(errors_path, "a", encoding="utf-8") as err_f:
         for _, row in tqdm(df_shard.iterrows(), total=len(df_shard), desc="Processing"):
             row_dict = row.to_dict()
             try:
-                process_sample(
+                info = process_sample(
                     row=row_dict,
                     cfg=cfg,
                     models=models,
@@ -563,11 +738,29 @@ def main():
                     output_root=output_root,
                 )
                 num_processed += 1
+                if collect_debug:
+                    debug_rows.append(info)
             except Exception as e:
                 num_failed += 1
                 logging.exception(f"Error processing id={row_dict.get('id')}: {e}")
                 err_f.write(f"{row_dict.get('id')}|{repr(e)}\n")
                 err_f.flush()
+                if collect_debug:
+                    debug_rows.append(
+                        {
+                            "id": row_dict.get("id"),
+                            "audio_path": row_dict.get("audio_path"),
+                            "status": f"error: {repr(e)}",
+                        }
+                    )
+
+    # If this was a dev/debug run, write a compact CSV summary under ./data.
+    if collect_debug and debug_rows:
+        debug_dir = Path("data") / "debug_runs"
+        ensure_dir(debug_dir)
+        debug_path = debug_dir / f"teacher_{args.lang}_{args.direction}_shard{args.shard_idx}.csv"
+        pd.DataFrame(debug_rows).to_csv(debug_path, index=False)
+        logging.info(f"Wrote debug summary to {debug_path}")
 
     logging.info(
         f"Done. Processed={num_processed}, Failed={num_failed}, Shard={args.shard_idx}/{args.num_shards}"
@@ -620,9 +813,10 @@ if __name__ == "__main__":
     setup_logging()
     cfg = load_config(args.config)
 
-    # --- DEBUG: test Whisper only ---
-    debug_test_whisper(cfg, args)
-    # exit after debug
-    raise SystemExit(0)
+    # Optional debug mode: test Whisper only on a single sample.
+    # Enable via: WHISPER_DEBUG=1 python run_teacher_cascade.py ...
+    if os.environ.get("WHISPER_DEBUG") == "1":
+        debug_test_whisper(cfg, args)
+        raise SystemExit(0)
 
-    # main()
+    main()

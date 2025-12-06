@@ -24,7 +24,7 @@ manifests:
 pipeline:
   # Keep only clips within this duration range (in seconds)
   min_duration: 2.0
-  max_duration: 15.0
+  max_duration: 150.0
 
   # Optional: for Golos, use tier filtering
   # Will be applied only if 'tier' column exists in manifest
