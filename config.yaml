@@ -1,0 +1,47 @@
+# ============================================
+# Global paths
+# ============================================
+# Root folder that contains your 'keep/en/...' and 'keep/ru/...'
+data_root: "D:/s2s-data"        # <-- CHANGE THIS to your actual path
+
+# Where to write parallel data, logs, errors, etc.
+output_root: "D:/s2s-data/s2s_teacher_out"   # <-- CHANGE if you want
+
+# ============================================
+# Input manifests
+# ============================================
+# Paths to your CSV manifests (relative or absolute)
+manifests:
+  # English People’s Speech manifest (the 1800h one)
+  en: "D:/s2s-data/keep/en/manifests/en_mono_clean.csv"   # <-- CHANGE
+
+  # Russian Golos manifest (the 1050h one)
+  ru: "D:/s2s-data/keep/ru/manifests/ru_mono_clean.csv"            # <-- CHANGE
+
+# ============================================
+# Pipeline options
+# ============================================
+pipeline:
+  # Keep only clips within this duration range (in seconds)
+  min_duration: 2.0
+  max_duration: 15.0
+
+  # Optional: for Golos, use tier filtering
+  # Will be applied only if 'tier' column exists in manifest
+  tier: "Gold"    # or ["Gold"] if you prefer list
+
+  # Reserved for future (e.g., using GPT-4o instead of M2M)
+  use_gpt4o: false
+
+# ============================================
+# Compute / runtime options
+# ============================================
+compute:
+  # Number of CPU workers you *might* use for pre/post-processing
+  num_workers: 4
+
+  # Default device (you can still override with --device in CLI)
+  device: "cuda:0"
+
+  # Logging interval for progress messages (currently unused, for extension)
+  log_interval: 10

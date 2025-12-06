@@ -1,0 +1,40 @@
+# -----------------------
+# Core runtime
+# -----------------------
+numpy>=1.23
+pandas>=2.0.0
+tqdm>=4.66.0
+pyyaml>=6.0.1
+soundfile>=0.12.1
+librosa>=0.10.1
+
+# -----------------------
+# HuggingFace / transformers stack
+# -----------------------
+transformers>=4.44.0
+accelerate>=0.33.0
+sentencepiece>=0.1.99
+
+# -----------------------
+# Audio codec + speaker models
+# -----------------------
+encodec>=0.1.1
+speechbrain>=0.5.16
+
+# -----------------------
+# Torch-related
+# -----------------------
+# IMPORTANT:
+# Install torch/torchaudio manually with the correct CUDA build, e.g.:
+#   pip install torch torchaudio --index-url https://download.pytorch.org/whl/cu122
+#
+#torch
+#torchaudio
+
+# -----------------------
+# OpenVoice (TTS/VC)
+# -----------------------
+# OpenVoice is typically installed from its Git repo, e.g.:
+#   pip install git+https://github.com/myshell-ai/OpenVoice.git
+#
+# If you wrap it as a package, add that here instead.
