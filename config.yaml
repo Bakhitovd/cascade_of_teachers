@@ -2,10 +2,10 @@
 # Global paths
 # ============================================
 # Root folder that contains your 'keep/en/...' and 'keep/ru/...'
-data_root: "D:/s2s-data"        # <-- CHANGE THIS to your actual path
+data_root: "C:/projects/cascade_of_teachers"        # <-- CHANGE THIS to your actual path
 
 # Where to write parallel data, logs, errors, etc.
-output_root: "D:/s2s-data/s2s_teacher_out"   # <-- CHANGE if you want
+output_root: "C:/projects/cascade_of_teachers/temp/output"   # <-- CHANGE if you want
 
 # ============================================
 # Input manifests

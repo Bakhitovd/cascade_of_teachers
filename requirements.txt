@@ -32,9 +32,11 @@ speechbrain>=0.5.16
 #torchaudio
 
 # -----------------------
-# OpenVoice (TTS/VC)
+# OpenVoice (TTS/VC & HTTP client)
 # -----------------------
-# OpenVoice is typically installed from its Git repo, e.g.:
+# OpenVoice itself is typically installed from its Git repo, e.g.:
 #   pip install git+https://github.com/myshell-ai/OpenVoice.git
 #
-# If you wrap it as a package, add that here instead.
+# For Dockerized OpenVoice accessed via Gradio HTTP API, we only need the
+# Python client on this machine:
+gradio_client>=1.4.0

@@ -337,40 +337,57 @@ class ECAPASpeakerEncoder:
 
 
 class OpenVoiceSynth:
-    """
-    MeloTTS-based TTS (no voice cloning yet).
+    """OpenVoice TTS via Dockerized Gradio API.
 
-    This wrapper uses MeloTTS models from the OpenVoice ecosystem to synthesize
-    target-language speech. It does NOT yet perform tone-color conversion or
-    use the ECAPA embedding; those can be added later once the basic TTS path
-    is stable in this environment.
+    This wrapper talks to an OpenVoice server running in Docker (Gradio UI)
+    instead of using local MeloTTS Python bindings. It:
+
+      * sends target text + reference audio over HTTP using ``gradio_client``
+      * receives a synthesized WAV file path from the client
+      * loads the audio into a float32 numpy array
+
+    Notes
+    -----
+    * ``speaker_embedding`` is currently unused here; voice cloning is handled
+      by OpenVoice itself using the reference audio.
+    * Only English target speech (``tgt_lang == 'en'``) is expected for RU→EN.
+    * The OpenVoice Gradio server must be running, e.g.:
+
+        docker run -it -p 7860:7860 myshell-openvoice
+
+      and accessible at ``http://localhost:7860/`` (overridable via
+      the ``OPENVOICE_GRADIO_URL`` environment variable).
     """
 
-    def __init__(self, device: str):
+    def __init__(self, device: str, base_url: str | None = None, style: str = "default,default"):
         self.device = torch.device(device)
-        logging.info(f"[openvoice] Initializing MeloTTS-based TTS on {self.device}")
+        self.base_url = base_url or os.environ.get("OPENVOICE_GRADIO_URL", "http://localhost:7860/")
+        self.style = style
 
-        # Local import so the rest of the script can still run if MeloTTS is missing.
+        logging.info(f"[openvoice] Initializing HTTP-based OpenVoice client on {self.device}")
+        logging.info(f"[openvoice] Target Gradio server URL: {self.base_url}")
+
+        # Import gradio_client lazily so the rest of the script can still run
+        # even if it's not installed yet.
         try:
-            from melo.api import TTS  # type: ignore[import]
-        except Exception as e:
+            from gradio_client import Client  # type: ignore[import]
+        except Exception as e:  # pragma: no cover - import error path
             logging.error(
-                f"[openvoice] Failed to import MeloTTS (melo.api.TTS). "
+                f"[openvoice] Failed to import gradio_client. "
                 f"OpenVoiceSynth will fall back to silence. Error: {e}"
             )
-            self.TTS = None
+            self._client_cls = None
+            self.client = None
         else:
-            self.TTS = TTS
-
-        # Directory for temporary wavs
-        self.tmp_dir = Path("openvoice_tmp")
-        ensure_dir(self.tmp_dir)
-
-        # Map our simple language codes to MeloTTS language codes.
-        # For ru→en, we only need English for now.
-        self.lang_map = {
-            "en": "EN_NEWEST",  # newest English base speaker model in MeloTTS
-        }
+            self._client_cls = Client
+            try:
+                self.client = self._client_cls(self.base_url)
+            except Exception as e:  # pragma: no cover - connection error path
+                logging.error(
+                    f"[openvoice] Could not connect to OpenVoice Gradio server at {self.base_url}. "
+                    f"Falling back to silence. Error: {e}"
+                )
+                self.client = None
 
     def synthesize(
         self,
@@ -380,56 +397,83 @@ class OpenVoiceSynth:
         src_audio_path: Path,
         sample_rate: int = 24000,
     ) -> np.ndarray:
+        """Call Dockerized OpenVoice via Gradio and return synthesized speech.
+
+        Parameters
+        ----------
+        text:
+            Target-language text to synthesize.
+        speaker_embedding:
+            ECAPA speaker embedding (unused by this wrapper; voice cloning is
+            driven by ``src_audio_path`` in the OpenVoice server).
+        tgt_lang:
+            Target language code ('en' or 'ru'). For now only 'en' is expected.
+        src_audio_path:
+            Path to source/reference waveform on this machine. ``gradio_client``
+            will upload this file to the server, so the Docker container does
+            **not** need direct filesystem access to this path.
+        sample_rate:
+            Desired output sample rate (used for sanity checks only).
+
+        Returns
+        -------
+        np.ndarray
+            1D float32 waveform. If anything fails, returns 1 second of silence.
         """
-        :param text: target language text
-        :param speaker_embedding: np.ndarray [D] (currently unused)
-        :param tgt_lang: 'en' or 'ru' (currently only 'en' is supported in this wrapper)
-        :param src_audio_path: Path to source/reference waveform (unused for now)
-        :param sample_rate: desired output sample rate
-        :return: waveform float32 [T] at sample_rate
-        """
+        # Handle empty text gracefully.
         if not text or not text.strip():
-            # Very short silence for empty text
             return np.zeros(int(sample_rate * 0.5), dtype=np.float32)
 
-        if self.TTS is None:
+        # Ensure we have a live client.
+        if self.client is None:
             logging.warning(
-                "[openvoice] MeloTTS (melo.api.TTS) is not available; "
-                "falling back to silence."
+                "[openvoice] gradio_client is not available or server is unreachable; "
+                "falling back to 1s of silence."
             )
             return np.zeros(int(sample_rate * 1.0), dtype=np.float32)
 
-        if tgt_lang not in self.lang_map:
-            raise NotImplementedError(
-                f"OpenVoice/MeloTTS wrapper currently only supports tgt_lang in "
-                f"{list(self.lang_map.keys())}, got {tgt_lang}"
+        # For now we only really support EN target in this wrapper.
+        if tgt_lang != "en":
+            logging.warning(
+                f"[openvoice] Expected tgt_lang='en' for this wrapper, got {tgt_lang!r}. "
+                "Proceeding anyway."
             )
 
-        language_code = self.lang_map[tgt_lang]
+        # Call the Gradio API. Based on the UI snippet you provided, the
+        # endpoint has fn_index=1 and takes:
+        #   1) text prompt (str)
+        #   2) style (str, e.g. 'default,default')
+        #   3) reference audio (local path or URL)
+        #   4) agree (bool)
+        try:
+            info, out_wav_path, ref_used = self.client.predict(
+                text,
+                self.style,
+                str(src_audio_path),
+                True,
+                fn_index=1,
+            )
+            logging.info(f"[openvoice] Gradio info: {info}")
+            logging.info(f"[openvoice] Synthesized audio path: {out_wav_path}")
+            logging.info(f"[openvoice] Reference audio used: {ref_used}")
+        except Exception as e:  # pragma: no cover - runtime error path
+            logging.error(f"[openvoice] Error calling OpenVoice Gradio API: {e}")
+            return np.zeros(int(sample_rate * 1.0), dtype=np.float32)
 
-        # 1) Use MeloTTS to synthesize base speech for the given text
-        model = self.TTS(language=language_code, device=str(self.device))
-        speaker_ids = model.hps.data.spk2id
-        if not speaker_ids:
-            raise RuntimeError("[openvoice] No speakers found in MeloTTS model")
+        # Load synthesized audio from the path returned by gradio_client.
+        try:
+            wav, sr = sf.read(str(out_wav_path), always_2d=False)
+        except Exception as e:  # pragma: no cover - IO error path
+            logging.error(f"[openvoice] Failed to read synthesized audio from {out_wav_path}: {e}")
+            return np.zeros(int(sample_rate * 1.0), dtype=np.float32)
 
-        # Pick the first available speaker as base speaker
-        base_speaker_key = next(iter(speaker_ids.keys()))
-        base_speaker_id = speaker_ids[base_speaker_key]
-
-        tgt_path = self.tmp_dir / "tmp_tgt.wav"
-        # Speed is adjustable; keep default 1.0 for now
-        model.tts_to_file(text, base_speaker_id, str(tgt_path), speed=1.0)
-
-        # 2) Load resulting audio and return as np.ndarray
-        wav, sr = sf.read(str(tgt_path), always_2d=False)
         if wav.ndim == 2:
             wav = wav.mean(axis=1)
         wav = wav.astype(np.float32)
 
         if sr != sample_rate:
             logging.warning(
-                f"[openvoice] MeloTTS output has sr={sr}, expected {sample_rate}; "
+                f"[openvoice] Synthesized audio has sr={sr}, expected {sample_rate}; "
                 "returning audio without resampling."
             )
             return wav
