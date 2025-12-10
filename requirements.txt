@@ -39,4 +39,4 @@ speechbrain>=0.5.16
 #
 # For Dockerized OpenVoice accessed via Gradio HTTP API, we only need the
 # Python client on this machine:
-gradio_client>=1.4.0
+# gradio_client>=1.4.0

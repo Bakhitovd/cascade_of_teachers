@@ -2,10 +2,10 @@
 # Global paths
 # ============================================
 # Root folder that contains your 'keep/en/...' and 'keep/ru/...'
-data_root: "C:/projects/cascade_of_teachers"        # <-- CHANGE THIS to your actual path
+data_root: "D:/s2s-data"        # <-- CHANGE THIS to your actual path
 
 # Where to write parallel data, logs, errors, etc.
-output_root: "C:/projects/cascade_of_teachers/temp/output"   # <-- CHANGE if you want
+output_root: "D:/projects/cascade_of_teachers/temp/output"   # <-- CHANGE if you want
 
 # ============================================
 # Input manifests
@@ -16,19 +16,18 @@ manifests:
   en: "D:/s2s-data/keep/en/manifests/en_mono_clean.csv"   # <-- CHANGE
 
   # Russian Golos manifest (the 1050h one)
-  ru: "D:/s2s-data/keep/ru/manifests/ru_mono_clean.csv"            # <-- CHANGE
+  ru: "D:/s2s-data/keep/ru/manifests/ru_mono_clean_v2.csv"            # <-- CHANGE
 
 # ============================================
 # Pipeline options
 # ============================================
 pipeline:
   # Keep only clips within this duration range (in seconds)
-  min_duration: 2.0
+  min_duration: 3
   max_duration: 150.0
 
-  # Optional: for Golos, use tier filtering
-  # Will be applied only if 'tier' column exists in manifest
-  tier: "Gold"    # or ["Gold"] if you prefer list
+  # Tier filtering disabled: use all rows regardless of 'tier'.
+  # (If you ever want to re-enable, add e.g. `tier: "Gold"` here.)
 
   # Reserved for future (e.g., using GPT-4o instead of M2M)
   use_gpt4o: false
@@ -45,3 +44,21 @@ compute:
 
   # Logging interval for progress messages (currently unused, for extension)
   log_interval: 10
+
+# ============================================
+# TTS options (Chatterbox)
+# ============================================
+tts:
+  # Audio prompt used for ChatterboxMultilingualTTS. If empty, the
+  # source utterance itself will be used as the prompt.
+  # audio_prompt_path: "temp/audio_samples/speach_sample_1_min_en_cut_1.0-15.0.wav"
+
+  # Style exaggeration (0.0 = flat, higher = more expressive)
+  exaggeration: 0.9
+
+# ============================================
+# Encodec options
+# ============================================
+encodec:
+  # Target bandwidth in kbps for EncodecModel.encodec_model_24khz
+  target_bandwidth: 6.0

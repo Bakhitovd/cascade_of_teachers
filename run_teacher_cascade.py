@@ -40,8 +40,14 @@ import numpy as np
 import pandas as pd
 import soundfile as sf
 import torch
+import torchaudio as ta
 import yaml
 from tqdm import tqdm
+
+from chatterbox.tts import ChatterboxTTS
+from chatterbox.mtl_tts import ChatterboxMultilingualTTS
+from encodec import EncodecModel
+from encodec.utils import convert_audio
 
 
 # =========================
@@ -336,58 +342,34 @@ class ECAPASpeakerEncoder:
         return emb_np
 
 
-class OpenVoiceSynth:
-    """OpenVoice TTS via Dockerized Gradio API.
+class ChatterboxTTSWrapper:
+    """TTS wrapper using ChatterboxMultilingualTTS.
 
-    This wrapper talks to an OpenVoice server running in Docker (Gradio UI)
-    instead of using local MeloTTS Python bindings. It:
-
-      * sends target text + reference audio over HTTP using ``gradio_client``
-      * receives a synthesized WAV file path from the client
-      * loads the audio into a float32 numpy array
-
-    Notes
-    -----
-    * ``speaker_embedding`` is currently unused here; voice cloning is handled
-      by OpenVoice itself using the reference audio.
-    * Only English target speech (``tgt_lang == 'en'``) is expected for RU→EN.
-    * The OpenVoice Gradio server must be running, e.g.:
-
-        docker run -it -p 7860:7860 myshell-openvoice
-
-      and accessible at ``http://localhost:7860/`` (overridable via
-      the ``OPENVOICE_GRADIO_URL`` environment variable).
+    This replaces the previous OpenVoiceSynth Gradio-based TTS.
     """
 
-    def __init__(self, device: str, base_url: str | None = None, style: str = "default,default"):
+    def __init__(
+        self,
+        device: str,
+        audio_prompt_path: str | None = None,
+        exaggeration: float = 0.9,
+    ):
         self.device = torch.device(device)
-        self.base_url = base_url or os.environ.get("OPENVOICE_GRADIO_URL", "http://localhost:7860/")
-        self.style = style
+        self.audio_prompt_path = audio_prompt_path
+        self.exaggeration = exaggeration
 
-        logging.info(f"[openvoice] Initializing HTTP-based OpenVoice client on {self.device}")
-        logging.info(f"[openvoice] Target Gradio server URL: {self.base_url}")
+        logging.info(f"[chatterbox-tts] Loading ChatterboxMultilingualTTS on {self.device}")
+        self.model = ChatterboxMultilingualTTS.from_pretrained(device=str(self.device))
 
-        # Import gradio_client lazily so the rest of the script can still run
-        # even if it's not installed yet.
-        try:
-            from gradio_client import Client  # type: ignore[import]
-        except Exception as e:  # pragma: no cover - import error path
-            logging.error(
-                f"[openvoice] Failed to import gradio_client. "
-                f"OpenVoiceSynth will fall back to silence. Error: {e}"
-            )
-            self._client_cls = None
-            self.client = None
-        else:
-            self._client_cls = Client
-            try:
-                self.client = self._client_cls(self.base_url)
-            except Exception as e:  # pragma: no cover - connection error path
-                logging.error(
-                    f"[openvoice] Could not connect to OpenVoice Gradio server at {self.base_url}. "
-                    f"Falling back to silence. Error: {e}"
-                )
-                self.client = None
+        # Try to get model sample rate; fall back to 24000 if not available
+        self.sample_rate = getattr(self.model, "sr", 24000)
+
+    def _lang_id(self, lang: str) -> str:
+        mapping = {
+            "ru": "RU",
+            "en": "EN",
+        }
+        return mapping.get(lang, lang.upper())
 
     def synthesize(
         self,
@@ -397,110 +379,95 @@ class OpenVoiceSynth:
         src_audio_path: Path,
         sample_rate: int = 24000,
     ) -> np.ndarray:
-        """Call Dockerized OpenVoice via Gradio and return synthesized speech.
+        """Run ChatterboxMultilingualTTS and return a mono float32 waveform.
 
-        Parameters
-        ----------
-        text:
-            Target-language text to synthesize.
-        speaker_embedding:
-            ECAPA speaker embedding (unused by this wrapper; voice cloning is
-            driven by ``src_audio_path`` in the OpenVoice server).
-        tgt_lang:
-            Target language code ('en' or 'ru'). For now only 'en' is expected.
-        src_audio_path:
-            Path to source/reference waveform on this machine. ``gradio_client``
-            will upload this file to the server, so the Docker container does
-            **not** need direct filesystem access to this path.
-        sample_rate:
-            Desired output sample rate (used for sanity checks only).
-
-        Returns
-        -------
-        np.ndarray
-            1D float32 waveform. If anything fails, returns 1 second of silence.
+        Unlike the previous implementation, this will raise on errors
+        instead of silently falling back to dummy audio.
         """
-        # Handle empty text gracefully.
         if not text or not text.strip():
-            return np.zeros(int(sample_rate * 0.5), dtype=np.float32)
+            raise ValueError("[chatterbox-tts] Empty text provided for synthesis")
 
-        # Ensure we have a live client.
-        if self.client is None:
+        lang_id = self._lang_id(tgt_lang)
+
+        # Always use the source utterance as the cloning prompt for per-sample voice cloning.
+        # This ensures each sample keeps its own speaker identity.
+        prompt_path = src_audio_path
+
+        if not prompt_path.exists():
+            raise FileNotFoundError(f"[chatterbox-tts] Prompt audio not found: {prompt_path}")
+
+        logging.info(
+            f"[chatterbox-tts] Synthesizing (lang_id={lang_id}, exaggeration={self.exaggeration}) "
+            f"with prompt={prompt_path}"
+        )
+
+        wav = self.model.generate(
+            text,
+            language_id=lang_id,
+            audio_prompt_path=str(prompt_path),
+            exaggeration=self.exaggeration,
+        )
+
+        # Convert to 1D float32 numpy array
+        if isinstance(wav, torch.Tensor):
+            if wav.dim() == 2:
+                # [C, T] -> mono
+                wav = wav.mean(dim=0)
+            elif wav.dim() > 2:
+                raise ValueError(f"[chatterbox-tts] Unexpected tensor shape from TTS: {tuple(wav.shape)}")
+            wav = wav.detach().cpu().numpy()
+
+        wav = np.asarray(wav, dtype=np.float32)
+
+        sr = self.sample_rate
+        if sample_rate is not None and sr != sample_rate:
             logging.warning(
-                "[openvoice] gradio_client is not available or server is unreachable; "
-                "falling back to 1s of silence."
-            )
-            return np.zeros(int(sample_rate * 1.0), dtype=np.float32)
-
-        # For now we only really support EN target in this wrapper.
-        if tgt_lang != "en":
-            logging.warning(
-                f"[openvoice] Expected tgt_lang='en' for this wrapper, got {tgt_lang!r}. "
-                "Proceeding anyway."
-            )
-
-        # Call the Gradio API. Based on the UI snippet you provided, the
-        # endpoint has fn_index=1 and takes:
-        #   1) text prompt (str)
-        #   2) style (str, e.g. 'default,default')
-        #   3) reference audio (local path or URL)
-        #   4) agree (bool)
-        try:
-            info, out_wav_path, ref_used = self.client.predict(
-                text,
-                self.style,
-                str(src_audio_path),
-                True,
-                fn_index=1,
-            )
-            logging.info(f"[openvoice] Gradio info: {info}")
-            logging.info(f"[openvoice] Synthesized audio path: {out_wav_path}")
-            logging.info(f"[openvoice] Reference audio used: {ref_used}")
-        except Exception as e:  # pragma: no cover - runtime error path
-            logging.error(f"[openvoice] Error calling OpenVoice Gradio API: {e}")
-            return np.zeros(int(sample_rate * 1.0), dtype=np.float32)
-
-        # Load synthesized audio from the path returned by gradio_client.
-        try:
-            wav, sr = sf.read(str(out_wav_path), always_2d=False)
-        except Exception as e:  # pragma: no cover - IO error path
-            logging.error(f"[openvoice] Failed to read synthesized audio from {out_wav_path}: {e}")
-            return np.zeros(int(sample_rate * 1.0), dtype=np.float32)
-
-        if wav.ndim == 2:
-            wav = wav.mean(axis=1)
-        wav = wav.astype(np.float32)
-
-        if sr != sample_rate:
-            logging.warning(
-                f"[openvoice] Synthesized audio has sr={sr}, expected {sample_rate}; "
+                f"[chatterbox-tts] Model sr={sr}, requested={sample_rate}; "
                 "returning audio without resampling."
             )
-            return wav
 
         return wav
 
 
 class EncodecWrapper:
     """
-    EnCodec stub.
-
-    For Option C we do not depend on the real EncodecModel; instead
-    we return a small fixed-size zero code tensor.
+    Real EnCodec wrapper using the 24 kHz, 6 kbps model.
+    Produces discrete codes [num_codebooks, num_frames].
     """
 
-    def __init__(self, device: str):
+    def __init__(self, device: str, target_bandwidth: float = 6.0):
         self.device = torch.device(device)
-        # Real Encodec initialization intentionally omitted.
+        logging.info(f"[encodec] Loading EncodecModel 24kHz on {self.device} (bw={target_bandwidth} kbps)")
+        self.model = EncodecModel.encodec_model_24khz()
+        self.model.set_target_bandwidth(target_bandwidth)
+        self.model.to(self.device)
+        self.model.eval()
+        self.sample_rate = self.model.sample_rate
 
+    @torch.inference_mode()
     def encode(self, waveform: np.ndarray, sr: int) -> np.ndarray:
-        """
-        :param waveform: float32 numpy array [T], mono
-        :param sr: sample rate of waveform (e.g. 24000)
-        :return: codes np.ndarray [num_codebooks, num_frames]
-        """
-        # Stub: 4 codebooks, 10 frames of zeros.
-        return np.zeros((4, 10), dtype=np.int64)
+        """Encode mono waveform to Encodec codes [num_codebooks, num_frames]."""
+        if waveform.ndim != 1:
+            raise ValueError(f"[encodec] Expected 1D mono waveform, got shape {waveform.shape}")
+
+        # [T] -> [B=1, C=1, T]
+        wav = torch.from_numpy(waveform).float().to(self.device)
+        wav = wav.unsqueeze(0).unsqueeze(0)  # [1, 1, T]
+
+        # Resample / adjust channels to what the model expects
+        wav = convert_audio(wav, sr, self.sample_rate, self.model.channels)  # [1, C, T]
+        logging.info(f"[encodec] Input to model.encode has shape {tuple(wav.shape)}")
+
+        encoded = self.model.encode(wav)
+
+        # encoded is a list of tuples (codes, scale); codes: [B, K, T]
+        codes, _ = encoded[0]
+        if codes.dim() != 3:
+            raise ValueError(f"[encodec] Expected codes with 3 dims [B,K,T], got {tuple(codes.shape)}")
+
+        codes = codes.squeeze(0).cpu().numpy().astype(np.int64)  # [K, T]
+        logging.info(f"[encodec] Encoded waveform to codes with shape {codes.shape}")
+        return codes
 
 
 # =========================
@@ -635,17 +602,17 @@ def process_sample(
     spk_emb = spk_encoder.embed(wav_src, sr_src)
     logging.info(f"[speaker] id={sample_id} emb_shape={spk_emb.shape}")
 
-    # 4) OpenVoice synthesis in target language
-    openvoice: OpenVoiceSynth = models["openvoice"]
-    wav_tgt = openvoice.synthesize(
+    # 4) TTS synthesis in target language (Chatterbox-based)
+    tts: ChatterboxTTSWrapper = models["openvoice"]
+    wav_tgt = tts.synthesize(
         text=tgt_text,
         speaker_embedding=spk_emb,
         tgt_lang=tgt_lang,
         src_audio_path=audio_path,
-        sample_rate=24000,  # OpenVoice V2 expects 24 kHz
+        sample_rate=24000,
     )
     sr_tgt = 24000
-    logging.info(f"[openvoice] id={sample_id} tgt_audio_len={len(wav_tgt) / sr_tgt:.2f}s at {sr_tgt} Hz")
+    logging.info(f"[tts] id={sample_id} tgt_audio_len={len(wav_tgt) / sr_tgt:.2f}s at {sr_tgt} Hz")
 
     # 5) EnCodec tokens from tgt.wav
     encodec: EncodecWrapper = models["encodec"]
@@ -714,16 +681,28 @@ def process_sample(
 # Model initialization
 # =========================
 
-def init_models(device: str) -> Dict[str, Any]:
-    """
-    Initialize and return all teacher models as a dict.
-    """
+def init_models(device: str, cfg: Dict[str, Any]) -> Dict[str, Any]:
+    """Initialize and return all teacher models as a dict."""
+
+    tts_cfg = cfg.get("tts", {})
+    tts_prompt = tts_cfg.get("audio_prompt_path")
+    tts_exaggeration = float(tts_cfg.get("exaggeration", 0.9))
+
+    encodec_cfg = cfg.get("encodec", {})
+    target_bandwidth = float(encodec_cfg.get("target_bandwidth", 6.0))
+
     models = {
         "whisper": WhisperASR(device=device, model_name="openai/whisper-large-v3"),
         "translator": M2MTranslator(device=device),
         "speaker": ECAPASpeakerEncoder(device=device),
-        "openvoice": OpenVoiceSynth(device=device),
-        "encodec": EncodecWrapper(device=device),
+        # Keep the key name "openvoice" so process_sample doesn't need changes,
+        # but it is now backed by ChatterboxMultilingualTTS.
+        "openvoice": ChatterboxTTSWrapper(
+            device=device,
+            audio_prompt_path=tts_prompt,
+            exaggeration=tts_exaggeration,
+        ),
+        "encodec": EncodecWrapper(device=device, target_bandwidth=target_bandwidth),
     }
     return models
 
@@ -759,7 +738,7 @@ def main():
         df_shard = df_shard.iloc[: args.max_samples].reset_index(drop=True)
         logging.info(f"Dev mode: limiting to first {len(df_shard)} samples (max-samples={args.max_samples})")
 
-    models = init_models(torch_device)
+    models = init_models(torch_device, cfg)
 
     errors_path = output_root / f"errors_{args.lang}_{args.direction}_shard{args.shard_idx}.log"
     num_processed = 0
