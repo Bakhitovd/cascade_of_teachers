@@ -475,21 +475,37 @@ class EncodecWrapper:
 # =========================
 
 def load_audio(path: Path, target_sr: int = 16000) -> (np.ndarray, int):
-    """Load mono audio as float32 numpy array [T]."""
+    """Load mono audio as float32 numpy array [T], resampling to target_sr if needed."""
     logging.info(f"[audio] Loading {path} (target_sr={target_sr})")
+
+    # 1) Load with soundfile
     wav, sr = sf.read(str(path), always_2d=False)
+
+    # 2) Force mono
     if wav.ndim == 2:
         wav = wav.mean(axis=1)
+
+    # 3) Ensure float32
     wav = wav.astype(np.float32)
 
+    # 4) Optional resampling step
     if sr != target_sr:
-        logging.error(f"[audio] Expected sr={target_sr}, got {sr} at {path}")
-        # TODO: use librosa or torchaudio resample
-        # e.g. librosa.resample(wav, orig_sr=sr, target_sr=target_sr)
-        raise NotImplementedError("Resampling not implemented yet")
+        logging.warning(
+            f"[audio] Resampling from sr={sr} to target_sr={target_sr} for {path}"
+        )
 
-    logging.info(f"[audio] Loaded {len(wav) / sr:.2f}s of audio from {path}")
-    return wav, target_sr
+        # soundfile → torch tensor [1, T]
+        wav_tensor = torch.from_numpy(wav).unsqueeze(0)  # [1, T]
+
+        # Use torchaudio for high-quality resampling
+        wav_resampled = ta.functional.resample(wav_tensor, sr, target_sr)  # [1, T']
+
+        # Back to 1D float32 numpy
+        wav = wav_resampled.squeeze(0).cpu().numpy().astype(np.float32)
+        sr = target_sr
+
+    logging.info(f"[audio] Loaded {len(wav) / sr:.2f}s of audio from {path} at {sr} Hz")
+    return wav, sr
 
 
 def ensure_dir(path: Path):
@@ -587,10 +603,28 @@ def process_sample(
     wav_src, sr_src = load_audio(audio_path, target_sr=target_sr)
     logging.info(f"[sample] id={sample_id} loaded src audio: {len(wav_src) / sr_src:.2f}s at {sr_src} Hz")
 
-    # 1) Whisper ASR
-    whisper: WhisperASR = models["whisper"]
-    src_text = whisper.transcribe(wav_src, sr_src, language=src_lang)
-    logging.info(f"[whisper] id={sample_id} src_len={len(src_text)} text_preview={src_text[:80]!r}")
+    # 1) Source text: either from manifest or Whisper ASR
+    pipeline_cfg = cfg.get("pipeline", {})
+    use_manifest_text = bool(pipeline_cfg.get("use_manifest_text", False))
+    text_column = pipeline_cfg.get("text_column", "text")
+
+    if use_manifest_text:
+        src_text = str(row.get(text_column, ""))
+        if not src_text.strip():
+            raise ValueError(
+                f"Empty manifest text for id={sample_id}, column={text_column!r}"
+            )
+        logging.info(
+            f"[src-text] id={sample_id} from manifest column={text_column}: "
+            f"preview={src_text[:80]!r}"
+        )
+    else:
+        whisper: WhisperASR = models["whisper"]
+        src_text = whisper.transcribe(wav_src, sr_src, language=src_lang)
+        logging.info(
+            f"[whisper] id={sample_id} src_len={len(src_text)} "
+            f"text_preview={src_text[:80]!r}"
+        )
 
     # 2) Translation
     translator: M2MTranslator = models["translator"]
@@ -691,8 +725,10 @@ def init_models(device: str, cfg: Dict[str, Any]) -> Dict[str, Any]:
     encodec_cfg = cfg.get("encodec", {})
     target_bandwidth = float(encodec_cfg.get("target_bandwidth", 6.0))
 
-    models = {
-        "whisper": WhisperASR(device=device, model_name="openai/whisper-large-v3"),
+    pipeline_cfg = cfg.get("pipeline", {})
+    use_manifest_text = bool(pipeline_cfg.get("use_manifest_text", False))
+
+    models: Dict[str, Any] = {
         "translator": M2MTranslator(device=device),
         "speaker": ECAPASpeakerEncoder(device=device),
         # Keep the key name "openvoice" so process_sample doesn't need changes,
@@ -704,6 +740,14 @@ def init_models(device: str, cfg: Dict[str, Any]) -> Dict[str, Any]:
         ),
         "encodec": EncodecWrapper(device=device, target_bandwidth=target_bandwidth),
     }
+
+    # Only load Whisper if we are not using manifest transcripts directly.
+    if not use_manifest_text:
+        models["whisper"] = WhisperASR(
+            device=device,
+            model_name="openai/whisper-large-v3",
+        )
+
     return models
 
 

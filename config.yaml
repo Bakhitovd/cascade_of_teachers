@@ -32,6 +32,11 @@ pipeline:
   # Reserved for future (e.g., using GPT-4o instead of M2M)
   use_gpt4o: false
 
+  # If true, skip Whisper ASR and use manifest transcripts directly.
+  # The column name is given by `text_column` below.
+  use_manifest_text: true
+  text_column: "text"
+
 # ============================================
 # Compute / runtime options
 # ============================================
